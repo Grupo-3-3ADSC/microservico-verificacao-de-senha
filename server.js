@@ -3,6 +3,7 @@ import nodemailer from 'nodemailer';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import 'dotenv/config';
+import rateLimit from 'express-rate-limit';
 
 const app = express();
 app.use(cors());
@@ -10,8 +11,9 @@ app.use(bodyParser.json());
 
 // Armazene os códigos temporariamente (em produção, use um banco de dados ou cache)
 const codes = {};
+const limiter = rateLimit({windowMs: 15 * 60 * 1000, max: 20 , message: 'Muitas requisições, tente novamente mais tarde.'})
 
-app.post('/enviar-codigo', async (req, res) => {
+app.post('/enviar-codigo', limiter ,async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: 'E-mail é obrigatório.' });
 
