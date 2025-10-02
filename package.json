@@ -13,6 +13,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "node-fetch": "^3.3.2",
     "nodemailer": "^7.0.3",
     "path": "^0.12.7",
     "url": "^0.11.4",
