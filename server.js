@@ -7,13 +7,27 @@ import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import fetch from 'node-fetch';
-
-const usedResetTokens = {};
-const codes = {};
+import { createClient } from 'redis';
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+
+// Configurar Redis Client
+const redisClient = createClient({
+    url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+redisClient.on('connect', () => console.log('✅ Conectado ao Redis'));
+
+await redisClient.connect();
+
+// Prefixos para organizar as chaves no Redis
+const REDIS_PREFIX = {
+    CODE: 'reset:code:',           // reset:code:email@example.com
+    TOKEN: 'reset:token:',         // reset:token:jti-uuid
+};
 
 function gerarResetToken(email) {
     const jti = uuidv4();
@@ -26,11 +40,6 @@ function gerarResetToken(email) {
         jwtid: jti,
     };
     const token = jwt.sign(payload, process.env.RESET_SECRET, options);
-    
-    usedResetTokens[jti] = { 
-        used: false, 
-        expires: Date.now() + 15 * 60 * 1000 
-    };
     
     return { token, jti, expiresIn: 15 * 60 };
 }
@@ -88,7 +97,6 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
         });
     }
 
-    // Valida formato do email
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
         return res.status(400).json({ 
@@ -97,7 +105,6 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
         });
     }
 
-    // Verifica se usuário existe no backend Java
     try {
         const usuarioResponse = await fetch(
             `${process.env.VITE_API_URL}/usuarios/buscar-por-email/${encodeURIComponent(email)}`
@@ -117,16 +124,12 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
         });
     }
    
-    // Gera código de 6 dígitos
     const codigo = Math.floor(100000 + Math.random() * 900000).toString();
     
-    // Salva o código (expira em 5 minutos)
-    codes[email] = { 
-        codigo, 
-        expires: Date.now() + 5 * 60 * 1000 
-    };
+    // Salva o código no Redis com expiração de 5 minutos
+    const codigoKey = `${REDIS_PREFIX.CODE}${email}`;
+    await redisClient.setEx(codigoKey, 5 * 60, codigo);
 
-    // Configura transporter do Nodemailer
     const transporter = nodemailer.createTransport({
         service: 'gmail',
         auth: {
@@ -136,13 +139,12 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
     });
 
     const mailOptions = {
-            from: '"CogniFlow" <cogniflow51@gmail.com>',
-            to: email,
-            subject: 'Código de Verificação - Mega Plate',
-            text: `Seu código de verificação é: ${codigo}`,
-            html: `<p>Seu código de verificação é: <b>${codigo}</b></p>`
-        };
-
+        from: '"CogniFlow" <cogniflow51@gmail.com>',
+        to: email,
+        subject: 'Código de Verificação - Mega Plate',
+        text: `Seu código de verificação é: ${codigo}`,
+        html: `<p>Seu código de verificação é: <b>${codigo}</b></p>`
+    };
 
     try {
         await transporter.sendMail(mailOptions);
@@ -152,6 +154,10 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
         });
     } catch (error) {
         console.error('Erro ao enviar e-mail:', error);
+        
+        // Remove o código do Redis se o email falhar
+        await redisClient.del(codigoKey);
+        
         res.status(500).json({ 
             success: false, 
             message: 'Erro ao enviar e-mail.' 
@@ -159,7 +165,6 @@ app.post('/enviar-codigo', limiter, async (req, res) => {
     }
 });
 
-// Endpoint para verificar código e gerar token
 app.post('/verificar-codigo', async (req, res) => {
     const { email, codigo } = req.body;
     
@@ -170,27 +175,20 @@ app.post('/verificar-codigo', async (req, res) => {
         });
     }
 
-    const registro = codes[email];
+    const codigoKey = `${REDIS_PREFIX.CODE}${email}`;
+    const codigoArmazenado = await redisClient.get(codigoKey);
     
-    if (!registro) {
+    if (!codigoArmazenado) {
         return res.status(400).json({ 
             success: false, 
-            message: 'Nenhum código pendente para este e-mail.' 
+            message: 'Nenhum código pendente ou código expirado.' 
         });
     }
 
-    if (registro.codigo !== codigo) {
+    if (codigoArmazenado !== codigo) {
         return res.status(400).json({ 
             success: false, 
             message: 'Código inválido.' 
-        });
-    }
-
-    if (Date.now() >= registro.expires) {
-        delete codes[email];
-        return res.status(400).json({ 
-            success: false, 
-            message: 'Código expirado.' 
         });
     }
 
@@ -198,11 +196,20 @@ app.post('/verificar-codigo', async (req, res) => {
     const { token, jti } = gerarResetToken(email);
     
     try {
+        // Salva informações do token no Redis (marca como não usado)
+        const tokenKey = `${REDIS_PREFIX.TOKEN}${jti}`;
+        const tokenData = JSON.stringify({
+            email,
+            used: false,
+            createdAt: Date.now()
+        });
+        await redisClient.setEx(tokenKey, 15 * 60, tokenData); // 15 minutos
+        
         // Salva o token no backend Java
         await salvarTokenNoBackend(email, token, jti);
         
         // Remove o código usado
-        delete codes[email];
+        await redisClient.del(codigoKey);
         
         res.json({ 
             success: true, 
@@ -218,8 +225,7 @@ app.post('/verificar-codigo', async (req, res) => {
     }
 });
 
-// Endpoint para validar se token já foi usado (opcional)
-app.post('/validar-token', (req, res) => {
+app.post('/validar-token', async (req, res) => {
     const { jti } = req.body;
     
     if (!jti) {
@@ -229,37 +235,41 @@ app.post('/validar-token', (req, res) => {
         });
     }
 
-    const tokenInfo = usedResetTokens[jti];
+    const tokenKey = `${REDIS_PREFIX.TOKEN}${jti}`;
+    const tokenData = await redisClient.get(tokenKey);
     
-    if (!tokenInfo) {
+    if (!tokenData) {
         return res.json({ 
             valid: false, 
-            message: 'Token não encontrado.' 
+            message: 'Token não encontrado ou expirado.' 
         });
     }
 
-    if (tokenInfo.used) {
-        return res.json({ 
+    try {
+        const parsed = JSON.parse(tokenData);
+        
+        if (parsed.used) {
+            return res.json({ 
+                valid: false, 
+                message: 'Token já foi utilizado.' 
+            });
+        }
+
+        res.json({ 
+            valid: true, 
+            message: 'Token válido.',
+            email: parsed.email
+        });
+    } catch (error) {
+        console.error('Erro ao parsear token data:', error);
+        res.status(500).json({ 
             valid: false, 
-            message: 'Token já foi utilizado.' 
+            message: 'Erro ao validar token.' 
         });
     }
-
-    if (Date.now() >= tokenInfo.expires) {
-        return res.json({ 
-            valid: false, 
-            message: 'Token expirado.' 
-        });
-    }
-
-    res.json({ 
-        valid: true, 
-        message: 'Token válido.' 
-    });
 });
 
-// Endpoint para marcar token como usado (chamado após sucesso)
-app.post('/marcar-token-usado', (req, res) => {
+app.post('/marcar-token-usado', async (req, res) => {
     const { jti } = req.body;
     
     if (!jti) {
@@ -269,36 +279,51 @@ app.post('/marcar-token-usado', (req, res) => {
         });
     }
 
-    if (usedResetTokens[jti]) {
-        usedResetTokens[jti].used = true;
+    const tokenKey = `${REDIS_PREFIX.TOKEN}${jti}`;
+    const tokenData = await redisClient.get(tokenKey);
+    
+    if (!tokenData) {
+        return res.status(404).json({ 
+            success: false, 
+            message: 'Token não encontrado.' 
+        });
     }
 
-    res.json({ 
-        success: true, 
-        message: 'Token marcado como usado.' 
-    });
+    try {
+        const parsed = JSON.parse(tokenData);
+        parsed.used = true;
+        parsed.usedAt = Date.now();
+        
+        // Mantém o token marcado como usado até expirar naturalmente
+        const ttl = await redisClient.ttl(tokenKey);
+        if (ttl > 0) {
+            await redisClient.setEx(tokenKey, ttl, JSON.stringify(parsed));
+        }
+
+        res.json({ 
+            success: true, 
+            message: 'Token marcado como usado.' 
+        });
+    } catch (error) {
+        console.error('Erro ao marcar token:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Erro ao processar.' 
+        });
+    }
 });
 
-// Limpeza periódica de tokens expirados
-setInterval(() => {
-    const now = Date.now();
-    
-    // Limpa códigos expirados
-    for (const email in codes) {
-        if (codes[email].expires < now) {
-            delete codes[email];
-        }
+// Health check
+app.get('/health', async (req, res) => {
+    try {
+        await redisClient.ping();
+        res.json({ status: 'ok', redis: 'connected' });
+    } catch (error) {
+        res.status(503).json({ status: 'error', redis: 'disconnected' });
     }
-    
-    // Limpa tokens expirados
-    for (const jti in usedResetTokens) {
-        if (usedResetTokens[jti].expires < now) {
-            delete usedResetTokens[jti];
-        }
-    }
-}, 5 * 60 * 1000); // A cada 5 minutos
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
 });
